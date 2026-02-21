@@ -13,10 +13,9 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType},
 };
 use serde::Deserialize;
-use std::{collections::VecDeque, error::Error, io, time::Duration};
+use std::{collections::VecDeque, env, error::Error, io, time::Duration};
 use tokio::sync::mpsc;
 
-const SYMBOLS: &[&str] = &["SOLUSDT", "BTCUSDT", "ETHUSDT"];
 const MAX_DATA_POINTS: usize = 600; // Increased history buffer
 const UPDATE_INTERVAL_MS: u64 = 100; // 0.1 seconds
 
@@ -65,6 +64,47 @@ struct App {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let symbols = if args.is_empty() {
+        vec!["SOLUSDT".to_string(), "BTCUSDT".to_string(), "ETHUSDT".to_string()]
+    } else {
+        args.into_iter()
+            .map(|s| {
+                let s = s.to_uppercase();
+                if s.ends_with("USDT") { s } else { format!("{}USDT", s) }
+            })
+            .collect()
+    };
+
+    let client = reqwest::Client::new();
+    let mut valid_symbols = Vec::new();
+    let mut has_warnings = false;
+
+    for sym in symbols {
+        let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", sym);
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => valid_symbols.push(sym),
+            Ok(_) => {
+                println!("Symbol {} not found", sym);
+                has_warnings = true;
+            }
+            Err(e) => {
+                println!("Error checking {}: {}", sym, e);
+                has_warnings = true;
+            }
+        }
+    }
+
+    if valid_symbols.is_empty() {
+        println!("No valid symbols to monitor. Exiting.");
+        return Ok(());
+    }
+
+    if has_warnings {
+        println!("Starting monitoring in 3 seconds...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -73,20 +113,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (tx, mut rx) = mpsc::channel(50);
     let mut app = App {
-        assets: SYMBOLS.iter().map(|&s| Asset::new(s)).collect(),
+        assets: valid_symbols.iter().map(|s| Asset::new(s)).collect(),
     };
+
+    let symbols_for_task = valid_symbols.clone();
 
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         loop {
-            for &symbol in SYMBOLS {
+            for symbol in &symbols_for_task {
                 let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", symbol);
-                // Note: Polling 3 endpoints at 10Hz can sometimes trigger rate limits,
-                // but we follow the pragmatic requirement.
-                if let Ok(resp) = client.get(&url).send().await {
-                    if let Ok(json) = resp.json::<PriceResponse>().await {
-                        let _ = tx.send((symbol.to_string(), json.price)).await;
-                    }
+                if let Ok(resp) = client.get(&url).send().await
+                    && let Ok(json) = resp.json::<PriceResponse>().await
+                {
+                    let _ = tx.send((symbol.clone(), json.price)).await;
                 }
             }
             tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
@@ -113,12 +153,11 @@ async fn run_app<B: Backend>(
 ) -> io::Result<bool> {
     terminal.draw(|f| ui(f, app))?;
 
-    if event::poll(Duration::from_millis(10))? {
-        if let Event::Key(key) = event::read()? {
-            if let KeyCode::Char('q') = key.code {
-                return Ok(true);
-            }
-        }
+    if event::poll(Duration::from_millis(10))?
+        && let Event::Key(key) = event::read()?
+        && let KeyCode::Char('q') = key.code
+    {
+        return Ok(true);
     }
 
     while let Ok((symbol, price)) = rx.try_recv() {
@@ -161,10 +200,13 @@ fn ui(f: &mut Frame, app: &App) {
         let dataset = Dataset::default()
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(match i {
+            .style(Style::default().fg(match i % 6 {
                 0 => Color::Cyan,
                 1 => Color::Yellow,
-                _ => Color::Magenta,
+                2 => Color::Magenta,
+                3 => Color::Green,
+                4 => Color::Red,
+                _ => Color::Blue,
             }))
             .data(&history);
 
