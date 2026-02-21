@@ -1,7 +1,5 @@
 # Crypto Watcher
 
-A minimalist, high-frequency terminal UI (TUI) crypto price watcher for SOL, BTC, and ETH.
-
 > **Note:** This project was created specifically to study and practice Rust programming concepts, particularly async runtime, TUI development, and clean code practices.
 
 ![Project Preview](./assets/preview.png)
@@ -10,8 +8,7 @@ A minimalist, high-frequency terminal UI (TUI) crypto price watcher for SOL, BTC
 
 ## Features
 
-- Monitors real-time prices for SOL, BTC, and ETH
-- Updates at high frequency (100ms) for a "live" feel
+- Monitors real-time prices for any symbol on Binance
 - Renders elegant sparkline charts using `ratatui`
 - Maintains persistent history up to 600 data points
 - Displays dynamically scaling Y-axes and human-readable X-axes with timestamps
@@ -46,7 +43,7 @@ cargo build --release
 Start the application directly using Cargo:
 
 ```bash
-cargo run
+cargo run <symbol1> <symbol2> ...
 ```
 
 Or run the compiled binary:
