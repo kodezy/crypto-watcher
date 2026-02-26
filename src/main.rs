@@ -1,4 +1,7 @@
-use chrono::{DateTime, Local};
+mod api;
+mod app;
+
+use app::{App, Asset};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -12,58 +15,22 @@ use ratatui::{
     symbols,
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType},
 };
-use serde::Deserialize;
-use std::{collections::VecDeque, env, error::Error, io, time::Duration};
+use std::{env, error::Error, io, time::Duration};
 use tokio::sync::mpsc;
 
-const MAX_DATA_POINTS: usize = 600; // Increased history buffer
-const UPDATE_INTERVAL_MS: u64 = 100; // 0.1 seconds
-
-#[derive(Deserialize)]
-struct PriceResponse {
-    price: String,
-}
-
-struct Asset {
-    name: String,
-    price: String,
-    history: VecDeque<(f64, f64)>, // (timestamp_f64, price)
-    timestamps: VecDeque<DateTime<Local>>,
-}
-
-impl Asset {
-    fn new(name: &str) -> Self {
-        Self {
-            name: name.replace("USDT", ""),
-            price: "0.00".to_string(),
-            history: VecDeque::with_capacity(MAX_DATA_POINTS),
-            timestamps: VecDeque::with_capacity(MAX_DATA_POINTS),
-        }
-    }
-
-    fn update(&mut self, price: String) {
-        self.price = price.clone();
-        if let Ok(p) = price.parse::<f64>() {
-            let now = Local::now();
-            let timestamp_f64 = now.timestamp() as f64 + (now.timestamp_subsec_millis() as f64 / 1000.0);
-
-            if self.history.len() >= MAX_DATA_POINTS {
-                self.history.pop_front();
-                self.timestamps.pop_front();
-            }
-
-            self.history.push_back((timestamp_f64, p));
-            self.timestamps.push_back(now);
-        }
-    }
-}
-
-struct App {
-    assets: Vec<Asset>,
-}
+const UPDATE_INTERVAL_MS: u64 = 100;
+const PRICE_CHANNEL_CAPACITY: usize = 50;
+const EVENT_POLL_MS: u64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Vec<String> = env::args().skip(1).collect();
     let symbols = if args.is_empty() {
         vec!["SOLUSDT".to_string(), "BTCUSDT".to_string(), "ETHUSDT".to_string()]
@@ -81,27 +48,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut has_warnings = false;
 
     for sym in symbols {
-        let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", sym);
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => valid_symbols.push(sym),
-            Ok(_) => {
-                println!("Symbol {} not found", sym);
+        match api::validate_symbol(&client, &sym).await {
+            Ok(true) => valid_symbols.push(sym),
+            Ok(false) => {
+                tracing::warn!("Symbol {} not found", sym);
                 has_warnings = true;
             }
             Err(e) => {
-                println!("Error checking {}: {}", sym, e);
+                tracing::warn!("Error checking {}: {}", sym, e);
                 has_warnings = true;
             }
         }
     }
 
     if valid_symbols.is_empty() {
-        println!("No valid symbols to monitor. Exiting.");
+        tracing::error!("No valid symbols to monitor. Exiting.");
         return Ok(());
     }
 
     if has_warnings {
-        println!("Starting monitoring in 3 seconds...");
+        tracing::info!("Starting monitoring in 3 seconds...");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
@@ -111,7 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (tx, mut rx) = mpsc::channel(50);
+    let (tx, mut rx) = mpsc::channel(PRICE_CHANNEL_CAPACITY);
     let mut app = App {
         assets: valid_symbols.iter().map(|s| Asset::new(s)).collect(),
     };
@@ -122,11 +88,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let client = reqwest::Client::new();
         loop {
             for symbol in &symbols_for_task {
-                let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", symbol);
-                if let Ok(resp) = client.get(&url).send().await
-                    && let Ok(json) = resp.json::<PriceResponse>().await
-                {
-                    let _ = tx.send((symbol.clone(), json.price)).await;
+                let url = api::binance_price_url(symbol);
+                match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(json) = resp.json::<api::PriceResponse>().await {
+                            let _ = tx.send((symbol.clone(), json.price)).await;
+                        } else {
+                            tracing::debug!("Failed to parse price response for {}", symbol);
+                        }
+                    }
+                    Ok(_) => tracing::debug!("Non-success response for {}", symbol),
+                    Err(e) => tracing::warn!("Fetch failed for {}: {}", symbol, e),
                 }
             }
             tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
@@ -153,7 +125,7 @@ async fn run_app<B: Backend>(
 ) -> io::Result<bool> {
     terminal.draw(|f| ui(f, app))?;
 
-    if event::poll(Duration::from_millis(10))?
+    if event::poll(Duration::from_millis(EVENT_POLL_MS))?
         && let Event::Key(key) = event::read()?
         && let KeyCode::Char('q') = key.code
     {
@@ -182,10 +154,10 @@ fn ui(f: &mut Frame, app: &App) {
 
     for (i, asset) in app.assets.iter().enumerate() {
         let history: Vec<(f64, f64)> = asset.history.iter().copied().collect();
-        let (min_t, max_t) = history
-            .first()
-            .map(|h| (h.0, history.last().unwrap().0))
-            .unwrap_or((0.0, 1.0));
+        let (min_t, max_t) = match (history.first(), history.last()) {
+            (Some(first), Some(last)) => (first.0, last.0),
+            _ => (0.0, 1.0),
+        };
         let (min_p, max_p) = history.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |acc, h| {
             (acc.0.min(h.1), acc.1.max(h.1))
         });
@@ -210,17 +182,13 @@ fn ui(f: &mut Frame, app: &App) {
             }))
             .data(&history);
 
-        // Calculate 5 timestamp bins for the X-axis
         let mut labels = vec![];
-        if asset.timestamps.len() >= 2 {
-            let start = asset.timestamps.front().unwrap();
-            let end = asset.timestamps.back().unwrap();
-            let diff = *end - *start;
-
+        if let (Some(&start), Some(&end)) = (asset.timestamps.front(), asset.timestamps.back()) {
+            let diff = end - start;
             for j in 0..5 {
                 let fraction = j as f64 / 4.0;
                 let ms_offset = (diff.num_milliseconds() as f64 * fraction) as i64;
-                let point_time = *start + chrono::Duration::milliseconds(ms_offset);
+                let point_time = start + chrono::Duration::milliseconds(ms_offset);
                 labels.push(point_time.format("%H:%M:%S").to_string().into());
             }
         } else {
