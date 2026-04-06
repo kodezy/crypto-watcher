@@ -23,20 +23,26 @@ impl Asset {
     pub fn update(&mut self, price: String) {
         self.price = price.clone();
         if let Ok(p) = price.parse::<f64>() {
-            let now = Local::now();
-            let timestamp_f64 = now.timestamp() as f64 + (now.timestamp_subsec_millis() as f64 / 1000.0);
-
-            if self.history.len() >= MAX_DATA_POINTS {
-                self.history.pop_front();
-                self.timestamps.pop_front();
-            }
-
-            self.history.push_back((timestamp_f64, p));
-            self.timestamps.push_back(now);
+            self.push_point(Local::now(), p);
         }
+    }
+
+    pub fn push_point(&mut self, timestamp: DateTime<Local>, price: f64) {
+        let timestamp_f64 = timestamp.timestamp() as f64 + (timestamp.timestamp_subsec_millis() as f64 / 1000.0);
+
+        if self.history.len() >= MAX_DATA_POINTS {
+            self.history.pop_front();
+            self.timestamps.pop_front();
+        }
+
+        self.history.push_back((timestamp_f64, price));
+        self.timestamps.push_back(timestamp);
+        self.price = format!("{:.4}", price);
     }
 }
 
 pub struct App {
     pub assets: Vec<Asset>,
+    pub interval: String,
+    pub lookback_points: usize,
 }
