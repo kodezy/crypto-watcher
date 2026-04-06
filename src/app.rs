@@ -1,6 +1,8 @@
 use chrono::{DateTime, Local};
 use std::collections::VecDeque;
 
+use crate::indicators::IndicatorConfig;
+
 pub const MAX_DATA_POINTS: usize = 600;
 
 pub struct Asset {
@@ -45,4 +47,5 @@ pub struct App {
     pub assets: Vec<Asset>,
     pub interval: String,
     pub lookback_points: usize,
+    pub indicators: IndicatorConfig,
 }

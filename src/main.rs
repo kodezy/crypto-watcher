@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod indicators;
 
 use app::{App, Asset, MAX_DATA_POINTS};
 use chrono::TimeZone;
@@ -8,13 +9,14 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use indicators::{IndicatorConfig, compute_overlays, compute_rsi};
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     symbols,
-    text::Line,
+    text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap},
 };
 use std::{env, error::Error, io, time::Duration};
@@ -30,12 +32,21 @@ const DEFAULT_SYMBOLS: [&str; 3] = ["SOLUSDT", "BTCUSDT", "ETHUSDT"];
 const ALLOWED_INTERVALS: [&str; 16] = [
     "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M",
 ];
+const UI_BORDER: Color = Color::Rgb(74, 81, 95);
+const PRICE_COLOR: Color = Color::Rgb(229, 189, 91);
+const RSI_COLOR: Color = Color::Rgb(143, 158, 255);
+const RSI_OVERBOUGHT_COLOR: Color = Color::Rgb(255, 110, 110);
+const RSI_OVERSOLD_COLOR: Color = Color::Rgb(80, 217, 153);
+const BB_MID_COLOR: Color = Color::Rgb(100, 162, 255);
+const BB_UPPER_COLOR: Color = Color::Rgb(255, 129, 117);
+const BB_LOWER_COLOR: Color = Color::Rgb(86, 214, 146);
 
 struct CliConfig {
     symbols: Vec<String>,
     interval: String,
     lookback_points: usize,
     refresh_ms: u64,
+    indicators: IndicatorConfig,
 }
 
 fn print_usage() {
@@ -48,6 +59,9 @@ fn print_usage() {
         MAX_LOOKBACK_POINTS
     );
     println!("  -r, --refresh-ms <MS>      Real-time price polling interval in milliseconds");
+    println!("  -I, --indicator <SPEC>     Indicator spec (repeatable):");
+    println!("                             sma:20, ema:50, bb:20:2, rsi:14");
+    println!("                             Default: EMA(20), SMA(50), RSI(14)");
     println!("  -h, --help                 Show this help");
     println!();
     println!("Examples:");
@@ -59,6 +73,7 @@ fn parse_cli_config() -> Result<CliConfig, String> {
     let mut interval = DEFAULT_INTERVAL.to_string();
     let mut lookback_points = DEFAULT_LOOKBACK_POINTS;
     let mut refresh_ms = UPDATE_INTERVAL_MS;
+    let mut indicator_specs = Vec::new();
     let mut raw_symbols = Vec::new();
 
     let mut args = env::args().skip(1);
@@ -83,6 +98,10 @@ fn parse_cli_config() -> Result<CliConfig, String> {
                 refresh_ms = value
                     .parse::<u64>()
                     .map_err(|_| "Invalid --refresh-ms: expected an integer in ms")?;
+            }
+            "-I" | "--indicator" => {
+                let value = args.next().ok_or("Missing value for --indicator")?;
+                indicator_specs.push(value);
             }
             _ if arg.starts_with('-') => {
                 return Err(format!("Unknown option: {}", arg));
@@ -122,11 +141,14 @@ fn parse_cli_config() -> Result<CliConfig, String> {
             .collect()
     };
 
+    let indicators = IndicatorConfig::parse(&indicator_specs)?;
+
     Ok(CliConfig {
         symbols,
         interval,
         lookback_points,
         refresh_ms,
+        indicators,
     })
 }
 
@@ -248,6 +270,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         assets: valid_symbols.iter().map(|s| Asset::new(s)).collect(),
         interval: cli.interval.clone(),
         lookback_points: cli.lookback_points,
+        indicators: cli.indicators.clone(),
     };
 
     let total_assets = app.assets.len();
@@ -346,19 +369,20 @@ async fn run_app<B: Backend>(
 fn ui(f: &mut Frame, app: &App) {
     let base_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)])
         .split(f.size());
 
     let header = Paragraph::new(Line::from(format!(
-        " Crypto Watcher  |  Interval: {}  |  Lookback: {} candles  |  Assets: {} ",
+        " Crypto Watcher  |  Interval: {}  |  Lookback: {} candles  |  Assets: {}  |  Indicators: {} ",
         app.interval,
         app.lookback_points,
-        app.assets.len()
+        app.assets.len(),
+        app.indicators.describe(),
     )))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(UI_BORDER)),
     )
     .style(Style::default().add_modifier(Modifier::BOLD));
     f.render_widget(header, base_chunks[0]);
@@ -379,72 +403,214 @@ fn ui(f: &mut Frame, app: &App) {
             (Some(first), Some(last)) => (first.0, last.0),
             _ => (0.0, 1.0),
         };
-        let (min_p, max_p) = if history.is_empty() {
-            (0.0, 1.0)
-        } else {
-            history.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |acc, h| {
-                (acc.0.min(h.1), acc.1.max(h.1))
+        let overlay_data = compute_overlays(&asset.history, &app.indicators.overlays);
+
+        let mut price_datasets = Vec::new();
+        price_datasets.push(
+            Dataset::default()
+                .name("Price")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(PRICE_COLOR))
+                .data(&history),
+        );
+
+        for (line_idx, line) in overlay_data.lines.iter().enumerate() {
+            let color = match line_idx % 6 {
+                0 => Color::Rgb(57, 179, 255),
+                1 => Color::Rgb(190, 107, 255),
+                2 => Color::Rgb(113, 227, 151),
+                3 => Color::Rgb(255, 132, 128),
+                4 => Color::Rgb(226, 175, 65),
+                _ => Color::Rgb(168, 176, 189),
+            };
+
+            price_datasets.push(
+                Dataset::default()
+                    .name(line.label.clone())
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(color))
+                    .data(&line.points),
+            );
+        }
+
+        for bb in &overlay_data.bollinger {
+            price_datasets.push(
+                Dataset::default()
+                    .name("BB Mid")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(BB_MID_COLOR))
+                    .data(&bb.middle),
+            );
+            price_datasets.push(
+                Dataset::default()
+                    .name("BB Upper")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(BB_UPPER_COLOR))
+                    .data(&bb.upper),
+            );
+            price_datasets.push(
+                Dataset::default()
+                    .name("BB Lower")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(BB_LOWER_COLOR))
+                    .data(&bb.lower),
+            );
+        }
+
+        let mut y_sources: Vec<&[(f64, f64)]> = vec![&history];
+        for line in &overlay_data.lines {
+            y_sources.push(&line.points);
+        }
+        for bb in &overlay_data.bollinger {
+            y_sources.push(&bb.middle);
+            y_sources.push(&bb.upper);
+            y_sources.push(&bb.lower);
+        }
+        let y_bounds = compute_padded_bounds(&y_sources);
+
+        let has_rsi = app.indicators.rsi_period.is_some();
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if has_rsi {
+                vec![Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]
+            } else {
+                vec![Constraint::Min(1)]
             })
-        };
+            .split(chart_chunks[i]);
 
-        let mut pad = (max_p - min_p) * 0.1;
-        if pad == 0.0 {
-            pad = if max_p == 0.0 { 1.0 } else { max_p * 0.001 };
-        }
-        let y_bounds = [min_p - pad, max_p + pad];
-
-        let dataset = Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(match i % 6 {
-                0 => Color::Cyan,
-                1 => Color::Yellow,
-                2 => Color::Magenta,
-                3 => Color::Green,
-                4 => Color::Red,
-                _ => Color::Blue,
-            }))
-            .data(&history);
-
-        let mut labels = vec![];
-        if let (Some(&start), Some(&end)) = (asset.timestamps.front(), asset.timestamps.back()) {
-            let diff = end - start;
-            let fmt = x_axis_time_format(diff);
-            for j in 0..5 {
-                let fraction = j as f64 / 4.0;
-                let ms_offset = (diff.num_milliseconds() as f64 * fraction) as i64;
-                let point_time = start + chrono::Duration::milliseconds(ms_offset);
-                labels.push(point_time.format(fmt).to_string().into());
-            }
-        } else {
-            labels = vec!["".into(), "".into(), "".into(), "".into(), "".into()];
-        }
-
-        let chart = Chart::new(vec![dataset])
+        let price_chart = Chart::new(price_datasets)
             .block(
                 Block::default()
                     .title(format!(" {} ${} | {} pts ", asset.name, asset.price, history.len()))
                     .title_style(Style::default().add_modifier(Modifier::BOLD))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(UI_BORDER)),
             )
-            .x_axis(Axis::default().bounds([min_t, max_t]).labels(labels))
-            .y_axis(Axis::default().bounds(y_bounds).labels(vec![
-                format!("{:.2}", y_bounds[0]).into(),
-                format!("{:.2}", (y_bounds[0] + y_bounds[1]) / 2.0).into(),
-                format!("{:.2}", y_bounds[1]).into(),
-            ]));
+            .x_axis(Axis::default().bounds([min_t, max_t]).labels(x_labels(asset)))
+            .y_axis(Axis::default().bounds(y_bounds).labels(y_labels(y_bounds)));
 
-        f.render_widget(chart, chart_chunks[i]);
-    }
+        f.render_widget(price_chart, inner_chunks[0]);
 
-    let footer =
-        Paragraph::new("Controls: q = quit  |  Startup config: --interval <tf> --lookback <n> --refresh-ms <ms>")
+        if let Some(period) = app.indicators.rsi_period {
+            let rsi = compute_rsi(&asset.history, period);
+            let upper_level = vec![(min_t, 70.0), (max_t, 70.0)];
+            let lower_level = vec![(min_t, 30.0), (max_t, 30.0)];
+
+            let rsi_chart = Chart::new(vec![
+                Dataset::default()
+                    .name("RSI")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(RSI_COLOR))
+                    .data(&rsi.line),
+                Dataset::default()
+                    .name("70")
+                    .marker(symbols::Marker::Dot)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(RSI_OVERBOUGHT_COLOR))
+                    .data(&upper_level),
+                Dataset::default()
+                    .name("30")
+                    .marker(symbols::Marker::Dot)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(RSI_OVERSOLD_COLOR))
+                    .data(&lower_level),
+            ])
             .block(
                 Block::default()
+                    .title(format!(" RSI {} ", period))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(UI_BORDER)),
             )
-            .wrap(Wrap { trim: true });
+            .x_axis(Axis::default().bounds([min_t, max_t]).labels(x_labels(asset)))
+            .y_axis(Axis::default().bounds([0.0, 100.0]).labels(vec![
+                "0".into(),
+                "50".into(),
+                "100".into(),
+            ]));
+
+            f.render_widget(rsi_chart, inner_chunks[1]);
+        }
+    }
+
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::raw("Legend: "),
+            Span::styled("Price", Style::default().fg(PRICE_COLOR)),
+            Span::raw(" | "),
+            Span::styled("SMA/EMA", Style::default().fg(Color::Rgb(57, 179, 255))),
+            Span::raw(" | "),
+            Span::styled("BB Mid", Style::default().fg(BB_MID_COLOR)),
+            Span::raw(" | "),
+            Span::styled("BB Upper", Style::default().fg(BB_UPPER_COLOR)),
+            Span::raw(" | "),
+            Span::styled("BB Lower", Style::default().fg(BB_LOWER_COLOR)),
+            Span::raw(" | "),
+            Span::styled("RSI", Style::default().fg(RSI_COLOR)),
+            Span::raw(" | "),
+            Span::styled("RSI 70", Style::default().fg(RSI_OVERBOUGHT_COLOR)),
+            Span::raw(" | "),
+            Span::styled("RSI 30", Style::default().fg(RSI_OVERSOLD_COLOR)),
+        ]),
+        Line::from("Controls: q = quit  |  CLI: --interval <tf> --lookback <n> --refresh-ms <ms> --indicator <spec>"),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(UI_BORDER)),
+    )
+    .wrap(Wrap { trim: true });
     f.render_widget(footer, base_chunks[2]);
+}
+
+fn x_labels(asset: &Asset) -> Vec<Span<'static>> {
+    let mut labels = vec![];
+    if let (Some(&start), Some(&end)) = (asset.timestamps.front(), asset.timestamps.back()) {
+        let diff = end - start;
+        let fmt = x_axis_time_format(diff);
+        for j in 0..5 {
+            let fraction = j as f64 / 4.0;
+            let ms_offset = (diff.num_milliseconds() as f64 * fraction) as i64;
+            let point_time = start + chrono::Duration::milliseconds(ms_offset);
+            labels.push(point_time.format(fmt).to_string().into());
+        }
+    } else {
+        labels = vec!["".into(), "".into(), "".into(), "".into(), "".into()];
+    }
+    labels
+}
+
+fn y_labels(bounds: [f64; 2]) -> Vec<Span<'static>> {
+    vec![
+        format!("{:.2}", bounds[0]).into(),
+        format!("{:.2}", (bounds[0] + bounds[1]) / 2.0).into(),
+        format!("{:.2}", bounds[1]).into(),
+    ]
+}
+
+fn compute_padded_bounds(datasets: &[&[(f64, f64)]]) -> [f64; 2] {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for dataset in datasets {
+        for (_, value) in dataset.iter() {
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+    }
+
+    if !min.is_finite() || !max.is_finite() {
+        return [0.0, 1.0];
+    }
+
+    let mut pad = (max - min) * 0.1;
+    if pad == 0.0 {
+        pad = if max == 0.0 { 1.0 } else { max.abs() * 0.001 };
+    }
+
+    [min - pad, max + pad]
 }
